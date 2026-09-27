@@ -23,6 +23,7 @@ const state = {
   sightFocus: null, // 当前高亮的视线对键 `${audienceId}|${targetId}`
   rigging: null, // 吊挂布景载荷核算结果（points / items / summary）
   costumeEval: null, // 演员换装核查评估结果（items / summary，按当前模式）
+  costumeSegment: null, // 换装表单当前选中的相邻口令区段（fromCueId|toCueId），重绘时按两条口令 ID 恢复
 };
 
 /* ---------- 工具 ---------- */
@@ -948,13 +949,12 @@ const COSTUME_STATUS_LABEL = {
   unknown: '❓ 无法评估',
 };
 
-/** 填充换装表单：相邻口令区段下拉（按演员分组，已登记的区段不再出现）与换装区域下拉 */
-function fillCostumeSelects() {
+/** 当前可登记的相邻口令区段（与服务端相邻判定同一口径：过滤失效区域后按时间升序，已登记的区段不再出现） */
+function costumeSegmentGroups() {
   const registered = new Set((state.data.costumeChanges || []).map((t) => `${t.fromCueId}|${t.toCueId}`));
   const areaIds = new Set(state.data.areas.map((a) => a.id));
   const groups = [];
   for (const actor of state.data.actors) {
-    // 与服务端相邻判定同一口径：过滤失效区域后按时间升序
     const cues = state.data.cues
       .filter((c) => c.actorId === actor.id && areaIds.has(c.areaId))
       .slice()
@@ -963,16 +963,64 @@ function fillCostumeSelects() {
     for (let i = 0; i + 1 < cues.length; i++) {
       const key = `${cues[i].id}|${cues[i + 1].id}`;
       if (registered.has(key)) continue; // 每个区段最多一项
-      options.push(
-        `<option value="${key}">${fmtTime(cues[i].time)} ${escapeHtml(areaName(cues[i].areaId))} → ` +
-          `${fmtTime(cues[i + 1].time)} ${escapeHtml(areaName(cues[i + 1].areaId))}</option>`
-      );
+      options.push({
+        key,
+        label: `${fmtTime(cues[i].time)} ${areaName(cues[i].areaId)} → ${fmtTime(cues[i + 1].time)} ${areaName(cues[i + 1].areaId)}`,
+      });
     }
-    if (options.length > 0) {
-      groups.push(`<optgroup label="${escapeHtml(actor.name)}">${options.join('')}</optgroup>`);
-    }
+    if (options.length > 0) groups.push({ name: actor.name, options });
   }
-  $('cc-segment').innerHTML = groups.join('') || '<option value="">暂无可登记的相邻口令区段</option>';
+  return groups;
+}
+
+/** 当前可登记区段的键集合（提交前核对用） */
+function costumeSegmentKeys() {
+  const keys = new Set();
+  for (const g of costumeSegmentGroups()) for (const o of g.options) keys.add(o.key);
+  return keys;
+}
+
+/** 区段失效提示（表单内联，持续展示到用户重新选择或登记成功） */
+function updateCostumeSegmentHint(show, msg) {
+  const el = $('cc-segment-hint');
+  el.textContent = show ? msg : '';
+  el.classList.toggle('hidden', !show);
+}
+
+const COSTUME_SEGMENT_STALE_MSG = '原选的相邻口令区段已失效（可能已登记或口令、区域发生变化），请重新选择';
+
+/**
+ * 填充换装表单：相邻口令区段下拉（按演员分组，已登记的区段不再出现）与换装区域下拉。
+ * 重绘时按两条口令 ID 恢复仍相邻且未登记的区段选择（换装区域由 fillSelect 保留、秒数输入不参与重绘）；
+ * 区段已被登记或因口令、区域变化而失效时清空选择并提示重新选择，不默认选中其他区段。
+ */
+function fillCostumeSelects() {
+  const groups = costumeSegmentGroups();
+  const validKeys = new Set();
+  const html = groups
+    .map((g) => {
+      const opts = g.options
+        .map((o) => {
+          validKeys.add(o.key);
+          return `<option value="${o.key}">${escapeHtml(o.label)}</option>`;
+        })
+        .join('');
+      return `<optgroup label="${escapeHtml(g.name)}">${opts}</optgroup>`;
+    })
+    .join('');
+  const segSelect = $('cc-segment');
+  segSelect.innerHTML = html || '<option value="">暂无可登记的相邻口令区段</option>';
+  const keep = state.costumeSegment;
+  if (keep && validKeys.has(keep)) {
+    segSelect.value = keep; // 仍相邻且未登记：按两条口令 ID 恢复选择
+    updateCostumeSegmentHint(false);
+  } else if (keep) {
+    // 已登记或口令 / 区域变化导致失效：清空选择并提示，不默认选中其他区段
+    state.costumeSegment = null;
+    segSelect.value = ''; // 无匹配项时 selectedIndex = -1，下拉显示为空
+    updateCostumeSegmentHint(true, COSTUME_SEGMENT_STALE_MSG);
+    toast(COSTUME_SEGMENT_STALE_MSG, true);
+  }
   fillSelect($('cc-area'), state.data.areas, '选择换装区域');
 }
 
@@ -1118,6 +1166,12 @@ function renderCostumeChanges() {
 }
 
 function bindCostume() {
+  // 记录用户显式选择的区段（重绘时按两条口令 ID 恢复的依据）
+  $('cc-segment').addEventListener('change', (e) => {
+    state.costumeSegment = e.target.value || null;
+    updateCostumeSegmentHint(false);
+  });
+
   $('form-costume').addEventListener('submit', (e) => {
     e.preventDefault();
     const seg = $('cc-segment').value;
@@ -1125,6 +1179,13 @@ function bindCostume() {
     const seconds = Number($('cc-seconds').value);
     if (!seg || !seg.includes('|')) {
       toast('请选择相邻口令区段', true);
+      return;
+    }
+    // 提交前按当前可登记区段核对：失效时阻止提交并重建下拉（保留换装区域与秒数输入）；
+    // 服务端的相邻性与重复登记校验仍作为最终约束
+    if (!costumeSegmentKeys().has(seg)) {
+      state.costumeSegment = seg; // 交由重建逻辑按失效选择处理：清空并提示
+      fillCostumeSelects();
       return;
     }
     if (!areaId) {
@@ -1139,6 +1200,8 @@ function bindCostume() {
     mutate(async () => {
       await api('/api/costume-changes', 'POST', { fromCueId, toCueId, areaId, seconds });
       $('cc-seconds').value = '';
+      state.costumeSegment = null; // 登记成功：区段转为已登记，不再按失效提示
+      updateCostumeSegmentHint(false);
     }, '换装任务已登记，已即时重算');
   });
 
@@ -1470,6 +1533,8 @@ function bindHeaderActions() {
       clearRigPointForm();
       clearRigItemForm();
       state.sightFocus = null;
+      state.costumeSegment = null;
+      updateCostumeSegmentHint(false);
       $('form-dependency').reset();
       $('form-costume').reset();
     }, '已恢复示例数据');
