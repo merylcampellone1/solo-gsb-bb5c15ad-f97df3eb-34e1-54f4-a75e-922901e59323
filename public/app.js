@@ -948,31 +948,79 @@ const COSTUME_STATUS_LABEL = {
   unknown: '❓ 无法评估',
 };
 
-/** 填充换装表单：相邻口令区段下拉（按演员分组，已登记的区段不再出现）与换装区域下拉 */
-function fillCostumeSelects() {
+/** 当前可登记的相邻口令区段（按演员分组）：与服务端相邻判定同一口径——过滤失效区域后按时间升序，已登记的区段不再出现 */
+function availableCostumeSegments() {
   const registered = new Set((state.data.costumeChanges || []).map((t) => `${t.fromCueId}|${t.toCueId}`));
   const areaIds = new Set(state.data.areas.map((a) => a.id));
   const groups = [];
   for (const actor of state.data.actors) {
-    // 与服务端相邻判定同一口径：过滤失效区域后按时间升序
     const cues = state.data.cues
       .filter((c) => c.actorId === actor.id && areaIds.has(c.areaId))
       .slice()
       .sort((x, y) => x.time - y.time);
-    const options = [];
+    const segments = [];
     for (let i = 0; i + 1 < cues.length; i++) {
       const key = `${cues[i].id}|${cues[i + 1].id}`;
       if (registered.has(key)) continue; // 每个区段最多一项
-      options.push(
-        `<option value="${key}">${fmtTime(cues[i].time)} ${escapeHtml(areaName(cues[i].areaId))} → ` +
-          `${fmtTime(cues[i + 1].time)} ${escapeHtml(areaName(cues[i + 1].areaId))}</option>`
-      );
+      segments.push({ key, from: cues[i], to: cues[i + 1] });
     }
-    if (options.length > 0) {
-      groups.push(`<optgroup label="${escapeHtml(actor.name)}">${options.join('')}</optgroup>`);
-    }
+    if (segments.length > 0) groups.push({ actor, segments });
   }
-  $('cc-segment').innerHTML = groups.join('') || '<option value="">暂无可登记的相邻口令区段</option>';
+  return groups;
+}
+
+/** 当前可登记区段键（fromCueId|toCueId）集合，提交前核对用 */
+function availableCostumeSegmentKeys() {
+  const keys = new Set();
+  for (const g of availableCostumeSegments()) for (const s of g.segments) keys.add(s.key);
+  return keys;
+}
+
+/** 区段选择刚因数据变化失效：占位项持续显示警示文案，直至用户重新选择 */
+let ccSegmentInvalidated = false;
+
+/**
+ * 填充换装表单：相邻口令区段下拉（按演员分组，已登记的区段不再出现）与换装区域下拉。
+ * 重绘时按两条口令 ID 保留仍相邻且未登记的区段选择（换装区域与秒数输入随之保留）；
+ * 区段已被登记或因口令 / 区域变化失效时，清空区段选择并提示重新选择，绝不默认选中其他区段。
+ */
+function fillCostumeSelects() {
+  const segSelect = $('cc-segment');
+  const prevKey = segSelect.value; // 重建前记住选中的区段键（fromCueId|toCueId）
+  const groups = availableCostumeSegments();
+  const validKeys = new Set();
+  for (const g of groups) for (const s of g.segments) validKeys.add(s.key);
+
+  const stillValid = prevKey !== '' && validKeys.has(prevKey);
+  if (prevKey !== '' && !stillValid) ccSegmentInvalidated = true;
+  if (stillValid) ccSegmentInvalidated = false;
+
+  const placeholder = ccSegmentInvalidated
+    ? '⚠️ 原选择的区段已失效，请重新选择'
+    : groups.length > 0
+      ? '选择相邻口令区段'
+      : '暂无可登记的相邻口令区段';
+  segSelect.innerHTML =
+    `<option value="" disabled selected>${placeholder}</option>` +
+    groups
+      .map(
+        (g) =>
+          `<optgroup label="${escapeHtml(g.actor.name)}">${g.segments
+            .map(
+              (s) =>
+                `<option value="${s.key}">${fmtTime(s.from.time)} ${escapeHtml(areaName(s.from.areaId))} → ` +
+                `${fmtTime(s.to.time)} ${escapeHtml(areaName(s.to.areaId))}</option>`
+            )
+            .join('')}</optgroup>`
+      )
+      .join('');
+
+  if (stillValid) {
+    segSelect.value = prevKey; // 仍相邻且未登记：保留原选择
+  } else if (prevKey !== '') {
+    segSelect.value = ''; // 已失效：回到占位项，不默认选中其他区段
+    toast('之前选择的换装区段已失效（口令 / 区域已变化或该区段已登记），请重新选择', true);
+  }
   fillSelect($('cc-area'), state.data.areas, '选择换装区域');
 }
 
@@ -1127,6 +1175,12 @@ function bindCostume() {
       toast('请选择相邻口令区段', true);
       return;
     }
+    // 提交前按当前可登记区段核对：失效时阻止提交并清空区段选择，保留换装区域与秒数输入
+    if (!availableCostumeSegmentKeys().has(seg)) {
+      fillCostumeSelects();
+      toast('所选区段已失效（口令 / 区域已变化或该区段已登记），未予登记；请重新选择区段', true);
+      return;
+    }
     if (!areaId) {
       toast('请选择换装区域', true);
       return;
@@ -1138,8 +1192,14 @@ function bindCostume() {
     const [fromCueId, toCueId] = seg.split('|');
     mutate(async () => {
       await api('/api/costume-changes', 'POST', { fromCueId, toCueId, areaId, seconds });
+      $('cc-segment').value = ''; // 刚登记的区段不再可登记，回到占位项（避免被误判为失效）
       $('cc-seconds').value = '';
     }, '换装任务已登记，已即时重算');
+  });
+
+  // 用户重新选择区段后，清除「原选择已失效」的占位警示
+  $('cc-segment').addEventListener('change', () => {
+    ccSegmentInvalidated = false;
   });
 
   $('costume-results').addEventListener('click', (e) => {
@@ -1472,6 +1532,7 @@ function bindHeaderActions() {
       state.sightFocus = null;
       $('form-dependency').reset();
       $('form-costume').reset();
+      ccSegmentInvalidated = false;
     }, '已恢复示例数据');
   });
   document.querySelectorAll('#mode-switch .mode-btn').forEach((btn) => {
